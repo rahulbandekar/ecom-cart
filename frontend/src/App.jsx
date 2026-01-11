@@ -4,7 +4,7 @@ import Navbar from "./components/Navbar";
 import ProductCard from "./components/ProductCard";
 import CartItem from "./components/CartItem";
 
-const API_BASE = "http://localhost:5000/api";
+const API_BASE = import.meta.env.VITE_API_BASE;
 
 function App() {
   const [products, setProducts] = useState([]);
