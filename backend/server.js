@@ -14,7 +14,7 @@ app.use(
     origin: [
       "http://localhost:3000", // CRA dev
       "http://localhost:5173", // Vite dev
-      "https://ecom-cart-ruby.vercel.app/"
+      "https://ecom-cart-ruby.vercel.app"
     ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
