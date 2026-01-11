@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import axios from "axios";
 import Navbar from "./components/Navbar";
 import ProductCard from "./components/ProductCard";
-import CartItem from "./components/Cartitem";
+import CartItem from "./components/CartItem";
 
 const API_BASE = "http://localhost:5000/api";
 
