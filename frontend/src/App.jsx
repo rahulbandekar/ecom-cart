@@ -1,65 +1,91 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import axios from "axios";
 import Navbar from "./components/Navbar";
 import ProductCard from "./components/ProductCard";
 import CartItem from "./components/CartItem";
+import ToastContainer from "./components/ToastContainer";
+import { useToast } from "./hooks/useToast";
 
-const API_BASE = import.meta.env.VITE_API_BASE;
+// Fallback to localhost so missing .env doesn't silently break everything
+const API_BASE =
+  import.meta.env.VITE_API_BASE || "http://localhost:5000/api";
 
-function App() {
-  const [products, setProducts] = useState([]);
-  const [cart, setCart] = useState({ items: [], total: 0 });
-  const [activeView, setActiveView] = useState("products");
+// Axios instance with credentials so session cookies are sent
+const api = axios.create({
+  baseURL: API_BASE,
+  withCredentials: true,
+});
+
+export default function App() {
+  const [products, setProducts]         = useState([]);
+  const [cart, setCart]                 = useState({ items: [], total: 0 });
+  const [activeView, setActiveView]     = useState("products");
   const [checkoutInfo, setCheckoutInfo] = useState({ name: "", email: "" });
-  const [receipt, setReceipt] = useState(null);
-  const [loading, setLoading] = useState(false);
+  const [receipt, setReceipt]           = useState(null);
+
+  // Per-product add-to-cart loading: Set<productId>
+  const [addingIds, setAddingIds]       = useState(new Set());
+
+  // Per-cart-item mutation loading maps
   const [updatingItemId, setUpdatingItemId] = useState(null);
   const [removingItemId, setRemovingItemId] = useState(null);
+
+  const [checkoutLoading, setCheckoutLoading] = useState(false);
+
+  const { toasts, toast } = useToast();
+
+  // ── Data fetchers ─────────────────────────────────────────────────────────
+
+  const fetchProducts = useCallback(async () => {
+    try {
+      const { data } = await api.get("/products");
+      setProducts(data);
+    } catch {
+      toast("Could not load products. Is the server running?", "error");
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const fetchCart = useCallback(async () => {
+    try {
+      const { data } = await api.get("/cart");
+      setCart(data);
+    } catch {
+      toast("Could not load cart.", "error");
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     fetchProducts();
     fetchCart();
-  }, []);
+  }, [fetchProducts, fetchCart]);
 
-  const fetchProducts = async () => {
-    try {
-      const response = await axios.get(`${API_BASE}/products`);
-      setProducts(response.data);
-    } catch (error) {
-      console.error("Error fetching products:", error);
-    }
-  };
-
-  const fetchCart = async () => {
-    try {
-      const response = await axios.get(`${API_BASE}/cart`);
-      setCart(response.data);
-    } catch (error) {
-      console.error("Error fetching cart:", error);
-    }
-  };
+  // ── Cart actions ──────────────────────────────────────────────────────────
 
   const addToCart = async (productId) => {
+    setAddingIds((prev) => new Set(prev).add(productId));
     try {
-      setLoading(true);
-      await axios.post(`${API_BASE}/cart`, { productId, quantity: 1 });
+      await api.post("/cart", { productId, quantity: 1 });
       await fetchCart();
-    } catch (error) {
-      console.error("Error adding to cart:", error);
-      alert("Error adding item to cart");
+      toast("Added to cart!", "success");
+    } catch {
+      toast("Could not add item to cart.", "error");
     } finally {
-      setLoading(false);
+      setAddingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(productId);
+        return next;
+      });
     }
   };
 
   const removeFromCart = async (cartItemId) => {
+    setRemovingItemId(cartItemId);
     try {
-      setRemovingItemId(cartItemId);
-      await axios.delete(`${API_BASE}/cart/${cartItemId}`);
+      await api.delete(`/cart/${cartItemId}`);
       await fetchCart();
-    } catch (error) {
-      console.error("Error removing from cart:", error);
-      alert("Error removing item from cart");
+      toast("Item removed.", "info");
+    } catch {
+      toast("Could not remove item.", "error");
     } finally {
       setRemovingItemId(null);
     }
@@ -67,51 +93,50 @@ function App() {
 
   const updateQuantity = async (cartItemId, newQuantity) => {
     if (newQuantity < 1) return;
-
+    setUpdatingItemId(cartItemId);
     try {
-      setUpdatingItemId(cartItemId);
-      await axios.put(`${API_BASE}/cart/${cartItemId}`, {
-        quantity: newQuantity,
-      });
+      await api.put(`/cart/${cartItemId}`, { quantity: newQuantity });
       await fetchCart();
-    } catch (error) {
-      console.error("Error updating quantity:", error);
-      alert("Error updating quantity");
+    } catch {
+      toast("Could not update quantity.", "error");
     } finally {
       setUpdatingItemId(null);
     }
   };
 
+  // ── Checkout ──────────────────────────────────────────────────────────────
+
   const handleCheckout = async (e) => {
     e.preventDefault();
     if (cart.items.length === 0) {
-      alert("Your cart is empty");
+      toast("Your cart is empty.", "error");
       return;
     }
 
+    setCheckoutLoading(true);
     try {
-      setLoading(true);
-      const response = await axios.post(`${API_BASE}/checkout`, {
+      const { data } = await api.post("/checkout", {
         customerInfo: checkoutInfo,
       });
-      setReceipt(response.data);
-      setActiveView("receipt");
+      setReceipt(data);
+      // Clear local state AFTER we have the receipt, not before
       setCart({ items: [], total: 0 });
       setCheckoutInfo({ name: "", email: "" });
-    } catch (error) {
-      console.error("Error during checkout:", error);
-      alert("Error during checkout. Please try again.");
+      setActiveView("receipt");
+    } catch (err) {
+      const message =
+        err.response?.data?.error || "Checkout failed. Please try again.";
+      toast(message, "error");
     } finally {
-      setLoading(false);
+      setCheckoutLoading(false);
     }
   };
 
-  const cartItemCount = cart.items.reduce(
-    (sum, item) => sum + item.quantity,
-    0
-  );
+  // ── Derived ───────────────────────────────────────────────────────────────
 
-  const productCount = products.length;
+  const cartItemCount = cart.items.reduce((sum, i) => sum + i.quantity, 0);
+
+  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <div className="min-h-screen bg-[#D9DFC6]/20">
@@ -119,9 +144,12 @@ function App() {
         activeView={activeView}
         setActiveView={setActiveView}
         cartItemCount={cartItemCount}
-        productCount={productCount}
+        productCount={products.length}
       />
+
       <main className="container mx-auto px-4 py-8">
+
+        {/* ── Products ── */}
         {activeView === "products" && (
           <div>
             <h2 className="text-2xl font-semibold text-center text-gray-800 mb-8">
@@ -133,13 +161,14 @@ function App() {
                   key={product.id}
                   product={product}
                   onAddToCart={addToCart}
-                  loading={loading}
+                  isAdding={addingIds.has(product.id)}
                 />
               ))}
             </div>
           </div>
         )}
 
+        {/* ── Cart ── */}
         {activeView === "cart" && (
           <div className="max-w-4xl mx-auto">
             <h2 className="text-2xl font-semibold text-center text-gray-800 mb-8">
@@ -188,8 +217,7 @@ function App() {
                   </h3>
                   <button
                     onClick={() => setActiveView("checkout")}
-                    className="px-6 py-3 rounded-full bg-black text-white text-sm font-medium
-           hover:opacity-90 transition"
+                    className="px-6 py-3 rounded-full bg-black text-white text-sm font-medium hover:opacity-90 transition"
                   >
                     Proceed to Checkout
                   </button>
@@ -199,21 +227,16 @@ function App() {
           </div>
         )}
 
+        {/* ── Checkout ── */}
         {activeView === "checkout" && (
           <div className="max-w-md mx-auto">
-            <h2
-              disabled={cart.items.length === 0}
-              className="text-2xl font-semibold text-center text-gray-800 mb-8"
-            >
+            <h2 className="text-2xl font-semibold text-center text-gray-800 mb-8">
               Checkout
             </h2>
             <form onSubmit={handleCheckout} className="card">
               <div className="space-y-4">
                 <div>
-                  <label
-                    htmlFor="name"
-                    className="block text-sm font-medium text-gray-700 mb-2"
-                  >
+                  <label htmlFor="name" className="block text-sm font-medium text-gray-700 mb-2">
                     Full Name
                   </label>
                   <input
@@ -223,15 +246,13 @@ function App() {
                     onChange={(e) =>
                       setCheckoutInfo({ ...checkoutInfo, name: e.target.value })
                     }
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-gray-900/2 focus:border-transparent"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-gray-900/20 focus:border-transparent"
                     required
                   />
                 </div>
+
                 <div>
-                  <label
-                    htmlFor="email"
-                    className="block text-sm font-medium text-gray-700 mb-2"
-                  >
+                  <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-2">
                     Email
                   </label>
                   <input
@@ -239,29 +260,19 @@ function App() {
                     id="email"
                     value={checkoutInfo.email}
                     onChange={(e) =>
-                      setCheckoutInfo({
-                        ...checkoutInfo,
-                        email: e.target.value,
-                      })
+                      setCheckoutInfo({ ...checkoutInfo, email: e.target.value })
                     }
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-900/2 focus:border-transparent"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-900/20 focus:border-transparent"
                     required
                   />
                 </div>
 
                 <div className="bg-gray-50 rounded-lg p-4">
-                  <h4 className="font-semibold text-gray-800 mb-3">
-                    Order Summary
-                  </h4>
+                  <h4 className="font-semibold text-gray-800 mb-3">Order Summary</h4>
                   <div className="space-y-2">
                     {cart.items.map((item) => (
-                      <div
-                        key={item.cartId}
-                        className="flex justify-between text-sm"
-                      >
-                        <span>
-                          {item.name} x {item.quantity}
-                        </span>
+                      <div key={item.cartId} className="flex justify-between text-sm">
+                        <span>{item.name} × {item.quantity}</span>
                         <span>${(item.quantity * item.price).toFixed(2)}</span>
                       </div>
                     ))}
@@ -282,10 +293,10 @@ function App() {
                   </button>
                   <button
                     type="submit"
-                    disabled={loading}
+                    disabled={checkoutLoading}
                     className="btn-success flex-1 disabled:bg-gray-400 disabled:cursor-not-allowed"
                   >
-                    {loading ? "Processing..." : "Confirm Order"}
+                    {checkoutLoading ? "Processing…" : "Confirm Order"}
                   </button>
                 </div>
               </div>
@@ -293,6 +304,7 @@ function App() {
           </div>
         )}
 
+        {/* ── Receipt modal ── */}
         {activeView === "receipt" && receipt && (
           <div className="fixed inset-0 bg-black/40 flex items-center justify-center px-4 z-50">
             <div className="bg-white rounded-xl p-6 max-w-sm w-full space-y-4">
@@ -303,16 +315,12 @@ function App() {
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
                   <span className="text-gray-500">Order ID</span>
-                  <span className="text-right break-all">
-                    {receipt.orderId}
-                  </span>
+                  <span className="text-right break-all">{receipt.orderId}</span>
                 </div>
-
                 <div className="flex justify-between">
                   <span className="text-gray-500">Date</span>
                   <span>{new Date(receipt.timestamp).toLocaleString()}</span>
                 </div>
-
                 <div className="flex justify-between">
                   <span className="text-gray-500">Customer</span>
                   <span className="text-right">{receipt.customer.name}</span>
@@ -321,10 +329,8 @@ function App() {
 
               <div className="border-t pt-3 space-y-2 text-sm">
                 {receipt.items.map((item) => (
-                  <div key={item.cartId} className="flex justify-between">
-                    <span>
-                      {item.name} × {item.quantity}
-                    </span>
+                  <div key={item.id} className="flex justify-between">
+                    <span>{item.name} × {item.quantity}</span>
                     <span>${(item.quantity * item.price).toFixed(2)}</span>
                   </div>
                 ))}
@@ -348,8 +354,8 @@ function App() {
           </div>
         )}
       </main>
+
+      <ToastContainer toasts={toasts} />
     </div>
   );
 }
-
-export default App;
