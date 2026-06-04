@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import session from "express-session";
 import { v4 as uuidv4 } from "uuid";
 import sqlite3 from "sqlite3";
 import path from "path";
@@ -8,13 +9,17 @@ import { fileURLToPath } from "url";
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middleware
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ─── Middleware ────────────────────────────────────────────────────────────────
+
 app.use(
   cors({
     origin: [
-      "http://localhost:3000", // CRA dev
-      "http://localhost:5173", // Vite dev
-      "https://ecom-cart-ruby.vercel.app"
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "https://ecom-cart-ruby.vercel.app",
     ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -22,15 +27,32 @@ app.use(
   })
 );
 app.use(express.json());
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || "vibe-commerce-dev-secret",
+    resave: false,
+    saveUninitialized: true,
+    cookie: {
+      secure: process.env.NODE_ENV === "production",
+      httpOnly: true,
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 1 week
+    },
+  })
+);
 
-// Define __dirname for ES Modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Attach a stable session cart ID to every request
+app.use((req, _res, next) => {
+  if (!req.session.cartId) {
+    req.session.cartId = uuidv4();
+  }
+  next();
+});
 
-// Initialize SQLite Database
+// ─── Database ─────────────────────────────────────────────────────────────────
+
 const db = new sqlite3.Database(path.join(__dirname, "data.sqlite"));
 
-const products = [
+const SEED_PRODUCTS = [
   {
     id: 1,
     name: "Wireless Headphones",
@@ -68,256 +90,230 @@ const products = [
   },
 ];
 
-
-// Initialize database tables
+// All DB setup is serialized — CREATE TABLE finishes before the seed check runs
 db.serialize(() => {
-  // Products table
   db.run(`
     CREATE TABLE IF NOT EXISTS products (
-      id INTEGER PRIMARY KEY,
-      name TEXT NOT NULL,
-      price REAL NOT NULL,
-      image TEXT,
+      id          INTEGER PRIMARY KEY,
+      name        TEXT    NOT NULL,
+      price       REAL    NOT NULL,
+      image       TEXT,
       description TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
-  // Cart items table
   db.run(`
     CREATE TABLE IF NOT EXISTS cart_items (
-      id TEXT PRIMARY KEY,
+      id         TEXT    PRIMARY KEY,
+      cart_id    TEXT    NOT NULL,
       product_id INTEGER NOT NULL,
-      quantity INTEGER NOT NULL,
-      added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      quantity   INTEGER NOT NULL,
+      added_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (product_id) REFERENCES products (id)
     )
   `);
+
+  // Seed only when table is empty — safely inside serialize so tables exist
+  db.get("SELECT COUNT(*) AS count FROM products", (err, row) => {
+    if (err) { console.error("Seed check failed:", err); return; }
+    if (row.count > 0) return;
+
+    const stmt = db.prepare(
+      "INSERT INTO products (id, name, price, image, description) VALUES (?, ?, ?, ?, ?)"
+    );
+    SEED_PRODUCTS.forEach((p) =>
+      stmt.run(p.id, p.name, p.price, p.image, p.description)
+    );
+    stmt.finalize(() => console.log("Products seeded."));
+  });
 });
 
-  // Insert mock products
-  db.get("SELECT COUNT(*) as count FROM products", (err, row) => {
-    if (err) {
-      console.error(err);
-      return;
-    }
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-    if (row.count === 0) {
-      const stmt = db.prepare(
-        "INSERT INTO products (id, name, price, image, description) VALUES (?, ?, ?, ?, ?)"
-      );
+/** Run db.all and return a promise */
+const dbAll = (sql, params = []) =>
+  new Promise((resolve, reject) =>
+    db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)))
+  );
 
-      products.forEach((product) => {
-        stmt.run(
-          product.id,
-          product.name,
-          product.price,
-          product.image,
-          product.description
-        );
-      });
+/** Run db.get and return a promise */
+const dbGet = (sql, params = []) =>
+  new Promise((resolve, reject) =>
+    db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)))
+  );
 
-      stmt.finalize();
-      console.log("Mock products seeded");
-    }
-  });
+/** Run db.run and return a promise (resolves with `this` for changes/lastID) */
+const dbRun = (sql, params = []) =>
+  new Promise((resolve, reject) =>
+    db.run(sql, params, function (err) {
+      err ? reject(err) : resolve(this);
+    })
+  );
 
+// ─── Routes ───────────────────────────────────────────────────────────────────
 
-// Routes
-
-// GET /api/products - Get all products
-app.get("/api/products", (req, res) => {
-  db.all("SELECT * FROM products", (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
+// GET /api/products
+app.get("/api/products", async (_req, res) => {
+  try {
+    const rows = await dbAll("SELECT * FROM products");
     res.json(rows);
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// GET /api/cart - Get cart items with total
-app.get("/api/cart", (req, res) => {
-  const query = `
-    SELECT ci.id, ci.product_id, ci.quantity, p.name, p.price, p.image,
-           (ci.quantity * p.price) as item_total
-    FROM cart_items ci
-    JOIN products p ON ci.product_id = p.id
-  `;
+// GET /api/cart
+app.get("/api/cart", async (req, res) => {
+  try {
+    const rows = await dbAll(
+      `SELECT ci.id, ci.product_id, ci.quantity,
+              p.name, p.price, p.image,
+              (ci.quantity * p.price) AS item_total
+       FROM cart_items ci
+       JOIN products p ON ci.product_id = p.id
+       WHERE ci.cart_id = ?`,
+      [req.session.cartId]
+    );
 
-  db.all(query, (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-
-    const total = rows.reduce((sum, item) => sum + item.item_total, 0);
+    const total = rows.reduce((sum, r) => sum + r.item_total, 0);
     res.json({
-      items: rows.map((item) => ({
-        cartId: item.id,
-        productId: item.product_id,
-        name: item.name,
-        price: item.price,
-        image: item.image,
-        quantity: item.quantity,
-        itemTotal: item.item_total,
+      items: rows.map((r) => ({
+        cartId: r.id,
+        productId: r.product_id,
+        name: r.name,
+        price: r.price,
+        image: r.image,
+        quantity: r.quantity,
+        itemTotal: parseFloat(r.item_total.toFixed(2)),
       })),
       total: parseFloat(total.toFixed(2)),
     });
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// POST /api/cart - Add item to cart
-app.post("/api/cart", (req, res) => {
-  const { productId, quantity } = req.body;
+// POST /api/cart
+app.post("/api/cart", async (req, res) => {
+  const productId = parseInt(req.body.productId, 10);
+  const quantity = parseInt(req.body.quantity, 10);
 
-  if (!productId || !quantity || quantity < 1) {
-    return res.status(400).json({ error: "Invalid productId or quantity" });
+  if (!Number.isInteger(productId) || productId < 1) {
+    return res.status(400).json({ error: "productId must be a positive integer" });
+  }
+  if (!Number.isInteger(quantity) || quantity < 1) {
+    return res.status(400).json({ error: "quantity must be a positive integer" });
   }
 
-  // Check if product exists
-  db.get("SELECT * FROM products WHERE id = ?", [productId], (err, product) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    if (!product) {
-      return res.status(404).json({ error: "Product not found" });
-    }
+  try {
+    const product = await dbGet("SELECT id FROM products WHERE id = ?", [productId]);
+    if (!product) return res.status(404).json({ error: "Product not found" });
 
-    // Check if item already in cart
-    db.get(
-      "SELECT * FROM cart_items WHERE product_id = ?",
-      [productId],
-      (err, existingItem) => {
-        if (err) {
-          return res.status(500).json({ error: err.message });
-        }
-
-        if (existingItem) {
-          // Update quantity
-          const newQuantity = existingItem.quantity + quantity;
-          db.run(
-            "UPDATE cart_items SET quantity = ? WHERE product_id = ?",
-            [newQuantity, productId],
-            function (err) {
-              if (err) {
-                return res.status(500).json({ error: err.message });
-              }
-              res.json({
-                message: "Cart updated successfully",
-                cartItemId: existingItem.id,
-              });
-            }
-          );
-        } else {
-          // Add new item
-          const cartItemId = uuidv4();
-          db.run(
-            "INSERT INTO cart_items (id, product_id, quantity) VALUES (?, ?, ?)",
-            [cartItemId, productId, quantity],
-            function (err) {
-              if (err) {
-                return res.status(500).json({ error: err.message });
-              }
-              res.json({ message: "Item added to cart", cartItemId });
-            }
-          );
-        }
-      }
+    const existing = await dbGet(
+      "SELECT id, quantity FROM cart_items WHERE cart_id = ? AND product_id = ?",
+      [req.session.cartId, productId]
     );
-  });
+
+    if (existing) {
+      await dbRun(
+        "UPDATE cart_items SET quantity = ? WHERE id = ?",
+        [existing.quantity + quantity, existing.id]
+      );
+      return res.json({ message: "Cart updated", cartItemId: existing.id });
+    }
+
+    const cartItemId = uuidv4();
+    await dbRun(
+      "INSERT INTO cart_items (id, cart_id, product_id, quantity) VALUES (?, ?, ?, ?)",
+      [cartItemId, req.session.cartId, productId, quantity]
+    );
+    res.json({ message: "Item added to cart", cartItemId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// DELETE /api/cart/:id - Remove item from cart
-app.delete("/api/cart/:id", (req, res) => {
-  const { id } = req.params;
-
-  db.run("DELETE FROM cart_items WHERE id = ?", [id], function (err) {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    if (this.changes === 0) {
+// DELETE /api/cart/:id
+app.delete("/api/cart/:id", async (req, res) => {
+  try {
+    const result = await dbRun(
+      "DELETE FROM cart_items WHERE id = ? AND cart_id = ?",
+      [req.params.id, req.session.cartId]
+    );
+    if (result.changes === 0) {
       return res.status(404).json({ error: "Cart item not found" });
     }
     res.json({ message: "Item removed from cart" });
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// PUT /api/cart/:id - Update item quantity
-app.put("/api/cart/:id", (req, res) => {
-  const { id } = req.params;
-  const { quantity } = req.body;
-
-  if (!quantity || quantity < 1) {
-    return res.status(400).json({ error: "Invalid quantity" });
+// PUT /api/cart/:id
+app.put("/api/cart/:id", async (req, res) => {
+  const quantity = parseInt(req.body.quantity, 10);
+  if (!Number.isInteger(quantity) || quantity < 1) {
+    return res.status(400).json({ error: "quantity must be a positive integer" });
   }
 
-  db.run(
-    "UPDATE cart_items SET quantity = ? WHERE id = ?",
-    [quantity, id],
-    function (err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      if (this.changes === 0) {
-        return res.status(404).json({ error: "Cart item not found" });
-      }
-      res.json({ message: "Cart item updated successfully" });
+  try {
+    const result = await dbRun(
+      "UPDATE cart_items SET quantity = ? WHERE id = ? AND cart_id = ?",
+      [quantity, req.params.id, req.session.cartId]
+    );
+    if (result.changes === 0) {
+      return res.status(404).json({ error: "Cart item not found" });
     }
-  );
+    res.json({ message: "Cart item updated" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// POST /api/checkout - Process checkout
-app.post("/api/checkout", (req, res) => {
+// POST /api/checkout
+app.post("/api/checkout", async (req, res) => {
   const { customerInfo, name, email } = req.body;
+  const customer = customerInfo || { name, email };
 
-  const finalCustomer = customerInfo || { name, email };
-
-  if (!finalCustomer?.name || !finalCustomer?.email) {
+  if (!customer?.name?.trim() || !customer?.email?.trim()) {
     return res.status(400).json({ error: "Name and email are required" });
   }
 
+  try {
+    const cartItems = await dbAll(
+      `SELECT ci.id, ci.product_id, ci.quantity,
+              p.name, p.price,
+              (ci.quantity * p.price) AS item_total
+       FROM cart_items ci
+       JOIN products p ON ci.product_id = p.id
+       WHERE ci.cart_id = ?`,
+      [req.session.cartId]
+    );
 
-  // Get current cart
-  db.all(
-    `
-    SELECT ci.id, ci.product_id, ci.quantity, p.name, p.price,
-           (ci.quantity * p.price) as item_total
-    FROM cart_items ci
-    JOIN products p ON ci.product_id = p.id
-  `,
-    (err, cartItems) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-
-      if (cartItems.length === 0) {
-        return res.status(400).json({ error: "Cart is empty" });
-      }
-
-      const total = cartItems.reduce((sum, item) => sum + item.item_total, 0);
-
-      // Create receipt
-      const receipt = {
-        orderId: uuidv4(),
-        customer: finalCustomer,
-        items: cartItems,
-        total: parseFloat(total.toFixed(2)),
-        timestamp: new Date().toISOString(),
-        status: "confirmed",
-      };
-      
-
-      // Clear cart after successful checkout
-      db.run("DELETE FROM cart_items", (err) => {
-        if (err) {
-          console.error("Error clearing cart:", err);
-        }
-      });
-
-      res.json(receipt);
+    if (cartItems.length === 0) {
+      return res.status(400).json({ error: "Cart is empty" });
     }
-  );
+
+    const total = cartItems.reduce((sum, r) => sum + r.item_total, 0);
+
+    const receipt = {
+      orderId: uuidv4(),
+      customer,
+      items: cartItems,
+      total: parseFloat(total.toFixed(2)),
+      timestamp: new Date().toISOString(),
+      status: "confirmed",
+    };
+
+    await dbRun("DELETE FROM cart_items WHERE cart_id = ?", [req.session.cartId]);
+
+    res.json(receipt);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// ─── Start ─────────────────────────────────────────────────────────────────────
+
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
